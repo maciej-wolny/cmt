@@ -109,28 +109,22 @@ def generate_commit_message(file_path: str, diff: str, debug_mode: bool = False)
             return file_path, "feat: add new file", None
             
         prompt = f"""
-Generate a commit message following the Conventional Commits specification for the following changes. Return as JSON with the specified structure.
+Generate a concise commit message following Conventional Commits format. Return as JSON.
 
-The commit message should follow this format:
-<type>[optional scope]: <description>
+Analyze the diff and create:
+1. HEADER: <type>: <short description> (max 50 chars, imperative mood)
+   Types: feat, fix, docs, style, refactor, test, chore
+2. BODY: Only if changes need explanation (max 2-3 lines)
+3. FOOTER: Only for breaking changes or issue refs
 
-[optional body]
+Keep it simple and focused. Most commits should only have a header.
 
-[optional footer]
-
-Rules:
-1. HEADER (required): Use conventional commit types (feat, fix, docs, style, refactor, test, chore, etc.) followed by a colon and imperative mood description (max 50 chars)
-2. BODY (optional): Explain what and why, not how. Include motivation for change (wrap at 72 chars per line)
-3. FOOTER (optional): Reference issues, breaking changes, etc.
-
-Return JSON format:
+Return JSON:
 {{
-  "header": "type: description",
-  "body": "optional detailed explanation",
-  "footer": "optional footer info"
+  "header": "type: brief description",
+  "body": null,
+  "footer": null
 }}
-
-If body or footer are not needed, set them to null.
 
 Diff:\n\n{diff_text}
 """
@@ -153,61 +147,63 @@ Diff:\n\n{diff_text}
         # Parse the JSON response
         try:
             result = json.loads(response.stdout)
-        except json.JSONDecodeError:
-            return file_path, "chore: automated commit", f"Invalid JSON response from LLM"
+            full_response = result['response'].strip()
             
-        full_response = result['response'].strip()
-        
-        if debug_mode:
-            print(f"\nDEBUG: Full LLM Response for {file_path}:")
-            print("-" * 40)
-            print(full_response)
-            print("-" * 40)
-        
-        # Handle Deepseek's thinking tags
-        if "<think>" in full_response and "</think>" in full_response:
-            json_content = full_response.split("</think>")[-1].strip()
-        else:
-            json_content = full_response
+            if debug_mode:
+                print(f"\nDEBUG: Full LLM Response for {file_path}:")
+                print("-" * 40)
+                print(full_response)
+                print("-" * 40)
             
-        # Parse the commit message JSON
-        try:
+            # Handle Deepseek's thinking tags - extract content after </think>
+            if "<think>" in full_response and "</think>" in full_response:
+                json_content = full_response.split("</think>")[-1].strip()
+            else:
+                json_content = full_response
+            
+            # Remove any markdown code blocks
+            if json_content.startswith('```json'):
+                json_content = json_content[7:].strip()
+            elif json_content.startswith('```'):
+                json_content = json_content[3:].strip()
+            
+            if json_content.endswith('```'):
+                json_content = json_content[:-3].strip()
+            
+            if debug_mode:
+                print(f"DEBUG: Final JSON content to parse: '{json_content}'")
+            
+            # Check if json_content is empty
+            if not json_content:
+                return file_path, "chore: update file", "Empty JSON content after processing"
+            
+            # Parse the commit message JSON
             commit_data = json.loads(json_content)
+            
+            # Extract components
             header = commit_data.get('header', '').strip()
             body = commit_data.get('body')
             footer = commit_data.get('footer')
             
-            # Build the complete commit message
-            commit_message = header
-            if body:
-                commit_message += f"\n\n{body.strip()}"
-            if footer:
-                commit_message += f"\n\n{footer.strip()}"
-                
-            # If header is empty, use default
+            # Validate header
             if not header:
                 return file_path, "chore: update file", None
-                
+            
+            # Build commit message following conventional commits format
+            commit_message = header
+            
+            # Add body if present and not null/empty
+            if body and body.strip():
+                commit_message += f"\n\n{body.strip()}"
+            
+            # Add footer if present and not null/empty  
+            if footer and footer.strip():
+                commit_message += f"\n\n{footer.strip()}"
+            
             return file_path, commit_message, None
             
         except (json.JSONDecodeError, KeyError) as e:
-            # Fallback to treating the response as plain text
-            lines = json_content.split('\n')
-            first_line = lines[0].strip()
-            
-            # If the first line is just backticks, take the next non-empty line
-            if first_line.startswith('```'):
-                for line in lines[1:]:
-                    line = line.strip()
-                    if line and not line.startswith('```'):
-                        first_line = line
-                        break
-            
-            # If message is empty after processing, use default
-            if not first_line:
-                return file_path, "chore: update file", None
-                
-            return file_path, first_line[:50], None
+            return file_path, "chore: update file", f"JSON parsing error: {str(e)}"
         
     except subprocess.TimeoutExpired:
         return file_path, "chore: automated commit", "LLM request timed out"
@@ -305,35 +301,33 @@ Respond with only the README content in markdown format inside the JSON."""
         ], capture_output=True, text=True, check=True)
         
         # Parse the JSON response
-        result = json.loads(response.stdout)
-        full_response = result['response'].strip()
-        
-        if debug_mode:
-            print("\nDEBUG: Full README Response:")
-            print("-" * 40)
-            print(full_response)
-            print("-" * 40)
-        
-        # Handle Deepseek's thinking tags
-        if "<think>" in full_response and "</think>" in full_response:
-            json_content = full_response.split("</think>")[-1].strip()
-        else:
-            json_content = full_response
-            
-        # Parse the README JSON
         try:
+            result = json.loads(response.stdout)
+            full_response = result['response'].strip()
+            
+            if debug_mode:
+                print("\nDEBUG: Full README Response:")
+                print("-" * 40)
+                print(full_response)
+                print("-" * 40)
+            
+            # Handle Deepseek's thinking tags - extract content after </think>
+            if "<think>" in full_response and "</think>" in full_response:
+                json_content = full_response.split("</think>")[-1].strip()
+            else:
+                json_content = full_response
+            
+            # Parse the README JSON
             readme_data = json.loads(json_content)
             content = readme_data.get('readme_content', '').strip()
             
             if not content:
-                # Fallback to treating the response as plain text
-                return json_content
+                return "# README\n\nProject documentation will be added here."
                 
             return content
             
-        except (json.JSONDecodeError, KeyError):
-            # Fallback to treating the response as plain text
-            return json_content
+        except (json.JSONDecodeError, KeyError) as e:
+            return f"# README\n\nProject documentation will be added here.\n\n<!-- JSON parsing error: {str(e)} -->"
         
     except Exception as e:
         print(f"Error generating README: {e}")
