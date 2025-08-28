@@ -17,7 +17,7 @@ def get_git_root() -> str:
         sys.exit(1)
 
 def get_changed_files() -> List[str]:
-    """Get list of modified and untracked files."""
+    """Get list of modified, untracked, and newly added files."""
     try:
         # Get modified files that are not ignored
         modified = subprocess.check_output([
@@ -33,20 +33,51 @@ def get_changed_files() -> List[str]:
             '--exclude=.idea/*'  # Explicitly exclude all files in .idea
         ]).decode('utf-8').split('\n')
         
-        # Combine files and filter
-        all_files = [f for f in modified + untracked if f]
+        # Get newly added files (staged but not committed)
+        newly_added = subprocess.check_output([
+            'git', 'diff', '--name-only', '--cached'
+        ]).decode('utf-8').split('\n')
         
-        # Additional explicit filtering for .idea files
-        filtered_files = [
-            f for f in all_files 
-            if not f.startswith('.idea/') and f != '.idea'
-        ]
+        # Combine files and filter
+        all_files = [f for f in modified + untracked + newly_added if f]
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        filtered_files = []
+        for f in all_files:
+            if f not in seen and not f.startswith('.idea/') and f != '.idea':
+                seen.add(f)
+                filtered_files.append(f)
         
         return filtered_files
         
     except subprocess.CalledProcessError as e:
         print(f"Error getting changed files: {e}")
         return []
+
+def is_file_addition_or_deletion(file_path: str) -> Tuple[bool, str]:
+    """Check if file is being added or deleted. Returns (is_addition_or_deletion, type)."""
+    try:
+        # Check if file exists
+        file_exists = os.path.exists(file_path)
+        
+        # Check if file is tracked in git
+        result = subprocess.run(['git', 'ls-files', '--error-unmatch', file_path],
+                               capture_output=True)
+        is_tracked = result.returncode == 0
+        
+        if file_exists and not is_tracked:
+            # File exists but not tracked = addition
+            return True, "addition"
+        elif not file_exists and is_tracked:
+            # File tracked but doesn't exist = deletion
+            return True, "deletion"
+        else:
+            # File modification or no change
+            return False, "modification"
+            
+    except Exception:
+        return False, "unknown"
 
 def get_file_diff(file_path: str) -> str:
     """Get the diff for a specific file."""
@@ -295,11 +326,16 @@ def main():
     # Process each file sequentially
     for file_path in changed_files:
         try:
+            # Check if this is a file addition or deletion
+            is_add_or_del, operation_type = is_file_addition_or_deletion(file_path)
+            
             # Get diff for single file
             diff = get_file_diff(file_path)
             
             if debug_mode:
                 print(f"\nDEBUG: Processing file: {file_path}")
+                print(f"Operation type: {operation_type}")
+                print(f"Is addition/deletion: {is_add_or_del}")
                 print(f"Diff:\n{diff}")
                 print("-" * 80)
             
@@ -312,12 +348,18 @@ def main():
                 continue
                 
             print(f"\nProcessing file: {file_path}")
+            print(f"Operation: {operation_type}")
             print(f"Committing with message: {message}")
             
             try:
                 # Commit and push this file
                 commit_and_push(file_path, message)
                 commit_summary.append((file_path, message, None))
+                
+                # For additions or deletions, we've already pushed, so continue
+                if is_add_or_del:
+                    print(f"File {operation_type} pushed immediately")
+                    
             except subprocess.CalledProcessError as e:
                 error_msg = str(e)
                 if "ignored by .gitignore" in error_msg:
@@ -374,4 +416,4 @@ def main():
     print("="*80)
 
 if __name__ == "__main__":
-    main() 
+    main()
