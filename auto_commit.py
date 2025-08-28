@@ -109,12 +109,29 @@ def generate_commit_message(file_path: str, diff: str, debug_mode: bool = False)
             return file_path, "feat: add new file", None
             
         prompt = f"""
-Write a concise and informative commit message for the following changes shown in the diff. This prompt is consumed programmaticaly so provide raw commit, without explaination.
-1. Begin with a short summary of the changes in imperative mood. It should aways start with a sinlge sentence.
-2. Clearly explain why these changes were made, but only if it's directly apparent from the diff.
-3. If multiple changes, Use bullet points to list multiple distinct changes if applicable.
-4. Ensure the message includes **only** the changes present in the diff, with no additional context, explanations, or assumptions.
-5. Avoid any speculative details or information that is not directly reflected in the changes of the diff. The message should be focused solely on the modifications made.
+Generate a commit message following the Conventional Commits specification for the following changes. Return as JSON with the specified structure.
+
+The commit message should follow this format:
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer]
+
+Rules:
+1. HEADER (required): Use conventional commit types (feat, fix, docs, style, refactor, test, chore, etc.) followed by a colon and imperative mood description (max 50 chars)
+2. BODY (optional): Explain what and why, not how. Include motivation for change (wrap at 72 chars per line)
+3. FOOTER (optional): Reference issues, breaking changes, etc.
+
+Return JSON format:
+{{
+  "header": "type: description",
+  "body": "optional detailed explanation",
+  "footer": "optional footer info"
+}}
+
+If body or footer are not needed, set them to null.
+
 Diff:\n\n{diff_text}
 """
         
@@ -126,7 +143,10 @@ Diff:\n\n{diff_text}
             '-d', json.dumps({
                 "model": "deepseek-r1:32b",
                 "prompt": prompt,
-                "stream": False
+                "stream": False,
+                "response_format": {
+                    "type": "json_object"
+                }
             })
         ], capture_output=True, text=True, check=True)
         
@@ -146,27 +166,48 @@ Diff:\n\n{diff_text}
         
         # Handle Deepseek's thinking tags
         if "<think>" in full_response and "</think>" in full_response:
-            message = full_response.split("</think>")[-1].strip()
+            json_content = full_response.split("</think>")[-1].strip()
         else:
-            message = full_response
+            json_content = full_response
             
-        # Clean up the message
-        lines = message.split('\n')
-        first_line = lines[0].strip()
-        
-        # If the first line is just backticks, take the next non-empty line
-        if first_line.startswith('```'):
-            for line in lines[1:]:
-                line = line.strip()
-                if line and not line.startswith('```'):
-                    first_line = line
-                    break
-        
-        # If message is empty after processing, use default
-        if not first_line:
-            return file_path, "chore: update file", None
+        # Parse the commit message JSON
+        try:
+            commit_data = json.loads(json_content)
+            header = commit_data.get('header', '').strip()
+            body = commit_data.get('body')
+            footer = commit_data.get('footer')
             
-        return file_path, first_line[:50], None
+            # Build the complete commit message
+            commit_message = header
+            if body:
+                commit_message += f"\n\n{body.strip()}"
+            if footer:
+                commit_message += f"\n\n{footer.strip()}"
+                
+            # If header is empty, use default
+            if not header:
+                return file_path, "chore: update file", None
+                
+            return file_path, commit_message, None
+            
+        except (json.JSONDecodeError, KeyError) as e:
+            # Fallback to treating the response as plain text
+            lines = json_content.split('\n')
+            first_line = lines[0].strip()
+            
+            # If the first line is just backticks, take the next non-empty line
+            if first_line.startswith('```'):
+                for line in lines[1:]:
+                    line = line.strip()
+                    if line and not line.startswith('```'):
+                        first_line = line
+                        break
+            
+            # If message is empty after processing, use default
+            if not first_line:
+                return file_path, "chore: update file", None
+                
+            return file_path, first_line[:50], None
         
     except subprocess.TimeoutExpired:
         return file_path, "chore: automated commit", "LLM request timed out"
@@ -229,7 +270,9 @@ def generate_readme(files: List[str], debug_mode: bool = False) -> str:
         files_info = "\n".join([f"Directory {dir_name}:\n" + "\n".join(f"- {f}" for f in files) 
                                for dir_name, files in file_structure.items()])
         
-        prompt = f"""Generate a comprehensive README.md file for this project. Include the following sections:
+        prompt = f"""Generate a comprehensive README.md file for this project. Return as JSON format.
+
+Include the following sections:
 1. Project name and brief description
 2. Project structure
 3. Installation instructions
@@ -240,7 +283,12 @@ Project name: {repo_name}
 Files structure:
 {files_info}
 
-Respond with only the README content in markdown format."""
+Return JSON format:
+{{
+  "readme_content": "markdown content here"
+}}
+
+Respond with only the README content in markdown format inside the JSON."""
 
         response = subprocess.run([
             'curl', 
@@ -249,7 +297,10 @@ Respond with only the README content in markdown format."""
             '-d', json.dumps({
                 "model": "deepseek-r1:32b",
                 "prompt": prompt,
-                "stream": False
+                "stream": False,
+                "response_format": {
+                    "type": "json_object"
+                }
             })
         ], capture_output=True, text=True, check=True)
         
@@ -265,11 +316,24 @@ Respond with only the README content in markdown format."""
         
         # Handle Deepseek's thinking tags
         if "<think>" in full_response and "</think>" in full_response:
-            content = full_response.split("</think>")[-1].strip()
+            json_content = full_response.split("</think>")[-1].strip()
         else:
-            content = full_response
+            json_content = full_response
             
-        return content
+        # Parse the README JSON
+        try:
+            readme_data = json.loads(json_content)
+            content = readme_data.get('readme_content', '').strip()
+            
+            if not content:
+                # Fallback to treating the response as plain text
+                return json_content
+                
+            return content
+            
+        except (json.JSONDecodeError, KeyError):
+            # Fallback to treating the response as plain text
+            return json_content
         
     except Exception as e:
         print(f"Error generating README: {e}")
