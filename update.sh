@@ -28,5 +28,5 @@ echo "Copying auto_commit.py to $DEST_DIR..."
 cp "$SOURCE_SCRIPT" "$DEST_SCRIPT"
 chmod +x "$DEST_SCRIPT"
 
-echo "Successfully installed auto_commit to $DEST_DIR"
-echo "You can now run 'auto_commit' from anywhere in your terminal" 
+echo "Successfully installed cmt to $DEST_DIR"
+echo "You can now run 'cmt' from anywhere in your terminal" 
