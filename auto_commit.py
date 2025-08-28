@@ -161,7 +161,7 @@ Diff:\n\n{diff_text}
             else:
                 json_content = full_response
             
-            # Remove any markdown code blocks
+            # Remove markdown code blocks that still appear despite json_object format
             if json_content.startswith('```json'):
                 json_content = json_content[7:].strip()
             elif json_content.startswith('```'):
@@ -362,7 +362,7 @@ def update_readme(debug_mode: bool = False):
 
 def main():
     # Parse command line arguments
-    debug_mode = "-debug" in sys.argv
+    debug_mode = "--debug" in sys.argv
     readme_mode = "--readme" in sys.argv
     
     # Change to git root directory
