@@ -157,6 +157,7 @@ Diff:\n\n{diff_text}
 """
         
         # Add timeout to curl request
+        print(f"Generating commit message for {file_path}... (waiting for LLM response)")
         response = subprocess.run([
             'curl',
             '-X', 'POST',
