@@ -7,8 +7,30 @@ import json
 import multiprocessing
 import time
 
-# Global variable to track last commit timestamp
-last_commit_time = None
+# File to store last commit timestamp globally
+def get_commit_timestamp_file() -> str:
+    """Get path to the global commit timestamp file."""
+    return os.path.expanduser('~/.cmt_last_commit')
+
+def load_last_commit_time() -> float:
+    """Load last commit timestamp from file."""
+    timestamp_file = get_commit_timestamp_file()
+    try:
+        if os.path.exists(timestamp_file):
+            with open(timestamp_file, 'r') as f:
+                return float(f.read().strip())
+    except (ValueError, IOError):
+        pass
+    return None
+
+def save_last_commit_time(timestamp: float):
+    """Save last commit timestamp to file."""
+    timestamp_file = get_commit_timestamp_file()
+    try:
+        with open(timestamp_file, 'w') as f:
+            f.write(str(timestamp))
+    except IOError as e:
+        print(f"Warning: Could not save commit timestamp: {e}")
 
 def get_git_root() -> str:
     """Get the root directory of the git repository."""
@@ -217,7 +239,6 @@ Diff:\n\n{diff_text}
 
 def commit_and_push(file_path: str, message: str):
     """Commit a single file and push to the current branch."""
-    global last_commit_time
     
     try:
         # Check if file is ignored by any .gitignore
@@ -249,7 +270,7 @@ def commit_and_push(file_path: str, message: str):
         print(f"Successfully committed and pushed {file_path} to {branch}")
         
         # Update last commit timestamp
-        last_commit_time = time.time()
+        save_last_commit_time(time.time())
         
     except subprocess.CalledProcessError as e:
         if "ignored by one of your .gitignore files" in str(e.stderr):
@@ -421,7 +442,7 @@ def main():
             
             try:
                 # Check if we need to wait before committing
-                global last_commit_time
+                last_commit_time = load_last_commit_time()
                 if last_commit_time is not None:
                     time_since_last_commit = time.time() - last_commit_time
                     wait_time = 61  # 1 minute + 1 second
@@ -461,6 +482,7 @@ def main():
                         print(f"Formatted terraform file: {file_path}")
                         try:
                             # Check if we need to wait before committing
+                            last_commit_time = load_last_commit_time()
                             if last_commit_time is not None:
                                 time_since_last_commit = time.time() - last_commit_time
                                 wait_time = 61  # 1 minute + 1 second
