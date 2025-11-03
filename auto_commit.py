@@ -5,37 +5,10 @@ from typing import List, Tuple
 import sys
 import json
 import multiprocessing
-import time
-
-# File to store last commit timestamp globally
-def get_commit_timestamp_file() -> str:
-    """Get path to the global commit timestamp file."""
-    return os.path.expanduser('~/.cmt_last_commit')
-
-def load_last_commit_time() -> float:
-    """Load last commit timestamp from file."""
-    timestamp_file = get_commit_timestamp_file()
-    try:
-        if os.path.exists(timestamp_file):
-            with open(timestamp_file, 'r') as f:
-                return float(f.read().strip())
-    except (ValueError, IOError):
-        pass
-    return None
-
-def save_last_commit_time(timestamp: float):
-    """Save last commit timestamp to file."""
-    timestamp_file = get_commit_timestamp_file()
-    try:
-        with open(timestamp_file, 'w') as f:
-            f.write(str(timestamp))
-    except IOError as e:
-        print(f"Warning: Could not save commit timestamp: {e}")
 
 def get_git_root() -> str:
     """Get the root directory of the git repository."""
     try:
-
         root = subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], 
                                      stderr=subprocess.DEVNULL)
         return root.decode('utf-8').strip()
@@ -157,7 +130,6 @@ Diff:\n\n{diff_text}
 """
         
         # Add timeout to curl request
-        print(f"Generating commit message for {file_path}... (waiting for LLM response)")
         response = subprocess.run([
             'curl',
             '-X', 'POST',
@@ -240,7 +212,6 @@ Diff:\n\n{diff_text}
 
 def commit_and_push(file_path: str, message: str):
     """Commit a single file and push to the current branch."""
-    
     try:
         # Check if file is ignored by any .gitignore
         check_ignored = subprocess.run(
@@ -269,9 +240,6 @@ def commit_and_push(file_path: str, message: str):
         # Push to current branch
         subprocess.run(['git', 'push', 'origin', branch], check=True)
         print(f"Successfully committed and pushed {file_path} to {branch}")
-        
-        # Update last commit timestamp
-        save_last_commit_time(time.time())
         
     except subprocess.CalledProcessError as e:
         if "ignored by one of your .gitignore files" in str(e.stderr):
@@ -442,16 +410,6 @@ def main():
             print(f"Committing with message: {message}")
             
             try:
-                # Check if we need to wait before committing
-                last_commit_time = load_last_commit_time()
-                if last_commit_time is not None:
-                    time_since_last_commit = time.time() - last_commit_time
-                    wait_time = 61  # 1 minute + 1 second
-                    if time_since_last_commit < wait_time:
-                        remaining_wait = wait_time - time_since_last_commit
-                        print(f"Waiting {remaining_wait:.1f} seconds before next commit...")
-                        time.sleep(remaining_wait)
-                
                 # Commit and push this file
                 commit_and_push(file_path, message)
                 commit_summary.append((file_path, message, None))
@@ -482,16 +440,6 @@ def main():
                     if content_before != content_after:
                         print(f"Formatted terraform file: {file_path}")
                         try:
-                            # Check if we need to wait before committing
-                            last_commit_time = load_last_commit_time()
-                            if last_commit_time is not None:
-                                time_since_last_commit = time.time() - last_commit_time
-                                wait_time = 61  # 1 minute + 1 second
-                                if time_since_last_commit < wait_time:
-                                    remaining_wait = wait_time - time_since_last_commit
-                                    print(f"Waiting {remaining_wait:.1f} seconds before terraform format commit...")
-                                    time.sleep(remaining_wait)
-                            
                             commit_and_push(file_path, "tf fmt")
                             commit_summary.append((file_path, "tf fmt", None))
                         except subprocess.CalledProcessError as e:
