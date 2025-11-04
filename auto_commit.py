@@ -5,6 +5,7 @@ from typing import List, Tuple
 import sys
 import json
 import multiprocessing
+import re
 
 def get_git_root() -> str:
     """Get the root directory of the git repository."""
@@ -360,16 +361,301 @@ def update_readme(debug_mode: bool = False):
         print(f"Error updating README: {e}")
         return False
 
+def get_diff_with_develop(debug_mode: bool = False) -> Tuple[str, int]:
+    """Get diff between current branch and develop. Returns (diff, token_count)."""
+    try:
+        # Get current branch
+        current_branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).decode('utf-8').strip()
+        
+        # Check if develop branch exists
+        result = subprocess.run(['git', 'show-ref', '--verify', '--quiet', 'refs/heads/develop'], 
+                               capture_output=True)
+        base_branch = 'develop' if result.returncode == 0 else 'main'
+        
+        if debug_mode:
+            print(f"Current branch: {current_branch}")
+            print(f"Base branch: {base_branch}")
+        
+        # Get diff
+        diff = subprocess.check_output(['git', 'diff', f'{base_branch}...HEAD']).decode('utf-8')
+        
+        # Rough token estimation (1 token ≈ 4 characters)
+        token_count = len(diff) // 4
+        
+        return diff, token_count
+        
+    except subprocess.CalledProcessError as e:
+        if debug_mode:
+            print(f"Error getting diff: {e}")
+        return "", 0
+
+def get_commit_messages_since_branch(base_branch: str = None, debug_mode: bool = False) -> List[str]:
+    """Get all commit messages since branching from base."""
+    try:
+        if not base_branch:
+            # Check if develop branch exists
+            result = subprocess.run(['git', 'show-ref', '--verify', '--quiet', 'refs/heads/develop'], 
+                                   capture_output=True)
+            base_branch = 'develop' if result.returncode == 0 else 'main'
+        
+        # Get commit messages since base branch
+        commits = subprocess.check_output([
+            'git', 'log', f'{base_branch}..HEAD', '--pretty=format:%s'
+        ]).decode('utf-8').split('\n')
+        
+        # Filter out empty lines
+        commits = [c.strip() for c in commits if c.strip()]
+        
+        if debug_mode:
+            print(f"Found {len(commits)} commits since {base_branch}")
+            for i, commit in enumerate(commits, 1):
+                print(f"  {i}. {commit}")
+        
+        return commits
+        
+    except subprocess.CalledProcessError as e:
+        if debug_mode:
+            print(f"Error getting commits: {e}")
+        return []
+
+def generate_mr_summary(diff: str = None, commits: List[str] = None, debug_mode: bool = False) -> str:
+    """Generate MR summary based on diff or commits."""
+    try:
+        if diff and len(diff) > 0:
+            # Use diff-based approach for detailed analysis
+            prompt = f"""
+Generate a merge request summary based on the following git diff. Analyze the changes and provide:
+
+1. A concise title (50 chars max)
+2. A summary of what was changed and why
+3. Key technical details if relevant
+4. Focus on the business value and impact
+
+Be accurate and factual. Don't make assumptions about features not evident in the diff.
+
+Return as JSON:
+{{
+  "title": "Brief MR title",
+  "summary": "Detailed summary of changes and rationale"
+}}
+
+Git diff:
+{diff[:50000]}  
+"""
+        elif commits and len(commits) > 0:
+            # Use commit-based approach when diff is too long
+            commits_text = "\n".join([f"- {commit}" for commit in commits])
+            prompt = f"""
+Generate a merge request summary based on the following commit messages. Analyze the commits and provide:
+
+1. A concise title (50 chars max) 
+2. A summary of what was accomplished and why
+3. Group related changes together
+4. Focus on the overall goal and business value
+
+Be accurate based on the commit messages. Don't invent features not mentioned.
+
+Return as JSON:
+{{
+  "title": "Brief MR title",
+  "summary": "Detailed summary of changes and rationale"
+}}
+
+Commit messages:
+{commits_text}
+"""
+        else:
+            return "No changes detected for merge request"
+        
+        if debug_mode:
+            print("DEBUG: Generating MR summary...")
+        
+        response = subprocess.run([
+            'curl',
+            '-X', 'POST',
+            'http://localhost:11434/api/generate',
+            '-d', json.dumps({
+                "model": "deepseek-r1:32b",
+                "prompt": prompt,
+                "stream": False,
+                "response_format": {
+                    "type": "json_object"
+                }
+            })
+        ], capture_output=True, text=True, check=True)
+        
+        # Parse the JSON response
+        try:
+            result = json.loads(response.stdout)
+            full_response = result['response'].strip()
+            
+            if debug_mode:
+                print("DEBUG: Full MR Response:")
+                print("-" * 40)
+                print(full_response)
+                print("-" * 40)
+            
+            # Handle Deepseek's thinking tags - extract content after </think>
+            if "<think>" in full_response and "</think>" in full_response:
+                json_content = full_response.split("</think>")[-1].strip()
+            else:
+                json_content = full_response
+            
+            # Remove markdown code blocks
+            if json_content.startswith('```json'):
+                json_content = json_content[7:].strip()
+            elif json_content.startswith('```'):
+                json_content = json_content[3:].strip()
+            
+            if json_content.endswith('```'):
+                json_content = json_content[:-3].strip()
+            
+            # Try to find JSON object in the response
+            json_match = re.search(r'\{.*\}', json_content, re.DOTALL)
+            if json_match:
+                json_content = json_match.group()
+            
+            if debug_mode:
+                print(f"DEBUG: Cleaned JSON content: '{json_content}'")
+            
+            # Parse the MR JSON
+            mr_data = json.loads(json_content)
+            
+            title = mr_data.get('title', 'Update branch').strip()
+            summary = mr_data.get('summary', 'Changes made to the codebase.').strip()
+            
+            return f"# {title}\n\n{summary}"
+            
+        except (json.JSONDecodeError, KeyError) as e:
+            if debug_mode:
+                print(f"JSON parsing error: {e}")
+            return "## Merge Request\n\nChanges have been made and are ready for review."
+        
+    except Exception as e:
+        if debug_mode:
+            print(f"Error generating MR summary: {e}")
+        return "## Merge Request\n\nChanges have been made and are ready for review."
+
+def create_merge_request(debug_mode: bool = False):
+    """Create a merge request with current branch against develop/main."""
+    try:
+        # Get current branch
+        current_branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).decode('utf-8').strip()
+        
+        # Check if develop branch exists, otherwise use main
+        result = subprocess.run(['git', 'show-ref', '--verify', '--quiet', 'refs/heads/develop'], 
+                               capture_output=True)
+        base_branch = 'develop' if result.returncode == 0 else 'main'
+        
+        print(f"Creating merge request from {current_branch} to {base_branch}")
+        
+        # Get diff to check size
+        diff, token_count = get_diff_with_develop(debug_mode)
+        
+        if not diff:
+            print("No changes detected between branches")
+            return False
+        
+        print(f"Diff size: ~{token_count} tokens")
+        
+        # Use appropriate strategy based on diff size
+        if token_count > 128000:
+            print("Diff too large, using commit-based summary...")
+            commits = get_commit_messages_since_branch(base_branch, debug_mode)
+            mr_summary = generate_mr_summary(commits=commits, debug_mode=debug_mode)
+        else:
+            print("Using diff-based summary...")
+            mr_summary = generate_mr_summary(diff=diff, debug_mode=debug_mode)
+        
+        if debug_mode:
+            print("DEBUG: Generated MR Summary:")
+            print("-" * 40)
+            print(mr_summary)
+            print("-" * 40)
+        
+        # Check if glab, gh, or hub is available
+        glab_available = subprocess.run(['which', 'glab'], capture_output=True).returncode == 0
+        hub_available = subprocess.run(['which', 'hub'], capture_output=True).returncode == 0
+        gh_available = subprocess.run(['which', 'gh'], capture_output=True).returncode == 0
+        
+        if glab_available:
+            # Use GitLab CLI
+            print("Using GitLab CLI (glab) to create merge request...")
+            result = subprocess.run([
+                'glab', 'mr', 'create',
+                '--target-branch', base_branch,
+                '--title', mr_summary.split('\n')[0].replace('# ', ''),
+                '--description', mr_summary
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print("Merge request created successfully!")
+                print(result.stdout)
+            else:
+                print(f"Error creating merge request: {result.stderr}")
+                
+        elif gh_available:
+            # Use GitHub CLI
+            print("Using GitHub CLI to create pull request...")
+            result = subprocess.run([
+                'gh', 'pr', 'create',
+                '--base', base_branch,
+                '--head', current_branch,
+                '--title', mr_summary.split('\n')[0].replace('# ', ''),
+                '--body', mr_summary
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print("Pull request created successfully!")
+                print(result.stdout)
+            else:
+                print(f"Error creating pull request: {result.stderr}")
+                
+        elif hub_available:
+            # Use Hub CLI  
+            print("Using Hub CLI to create pull request...")
+            result = subprocess.run([
+                'hub', 'pull-request',
+                '--base', base_branch,
+                '--head', current_branch,
+                '--message', mr_summary
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print("Pull request created successfully!")
+                print(result.stdout)
+            else:
+                print(f"Error creating pull request: {result.stderr}")
+        else:
+            # Fallback: output the summary for manual creation
+            print("No supported CLI tool found (glab, gh, hub)")
+            print("Here's the generated merge request content:\n")
+            print("="*80)
+            print(mr_summary)
+            print("="*80)
+            print(f"\nManually create MR from '{current_branch}' to '{base_branch}' using the above content")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error creating merge request: {e}")
+        return False
+
 def main():
     # Parse command line arguments
     debug_mode = "--debug" in sys.argv
     readme_mode = "--readme" in sys.argv
+    mr_mode = "--mr" in sys.argv
     
     # Change to git root directory
     os.chdir(get_git_root())
     
     if readme_mode:
         update_readme(debug_mode)
+        return
+    
+    if mr_mode:
+        create_merge_request(debug_mode)
         return
     
     # Get changed files
