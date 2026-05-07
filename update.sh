@@ -1,5 +1,5 @@
 #!/bin/bash
-
+gitlab.helsing-dev.ai
 # Exit on error
 set -e
 
