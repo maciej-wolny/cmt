@@ -29,9 +29,7 @@ def get_changed_files() -> List[str]:
         # Get untracked files that are not ignored
         untracked = subprocess.check_output([
             'git', 'ls-files', '--others',
-            '--exclude-from=.gitignore',  # Use .gitignore rules
-            '--exclude=.idea',  # Explicitly exclude .idea directory
-            '--exclude=.idea/*'  # Explicitly exclude all files in .idea
+            '--exclude-standard'  # Respect all gitignore rules
         ]).decode('utf-8').split('\n')
         
         # Get newly added files (staged but not committed)
@@ -39,8 +37,8 @@ def get_changed_files() -> List[str]:
             'git', 'diff', '--name-only', '--cached'
         ]).decode('utf-8').split('\n')
         
-        # Combine files and filter
-        all_files = [f for f in modified + untracked + newly_added if f]
+        # Combine files and filter (exclude directories)
+        all_files = [f for f in modified + untracked + newly_added if f and not os.path.isdir(f)]
         
         # Remove duplicates while preserving order
         seen = set()
@@ -83,6 +81,8 @@ def is_file_addition_or_deletion(file_path: str) -> Tuple[bool, str]:
 def get_file_diff(file_path: str) -> str:
     """Get the diff for a specific file."""
     try:
+        if os.path.isdir(file_path):
+            return ""
         if os.path.exists(file_path):
             # Check if file is tracked
             result = subprocess.run(['git', 'ls-files', '--error-unmatch', file_path],
@@ -90,8 +90,11 @@ def get_file_diff(file_path: str) -> str:
             is_tracked = result.returncode == 0
             
             if is_tracked:
+                # Check both unstaged and staged changes
                 diff = subprocess.check_output(['git', 'diff', file_path]).decode('utf-8')
-                return diff if diff else f"No changes in tracked file: {file_path}"
+                if not diff:
+                    diff = subprocess.check_output(['git', 'diff', '--cached', file_path]).decode('utf-8')
+                return diff
             else:
                 # For untracked files, mark as new and get content
                 with open(file_path, 'r') as f:
@@ -100,43 +103,63 @@ def get_file_diff(file_path: str) -> str:
     except (subprocess.CalledProcessError, FileNotFoundError):
         return ""
 
-def generate_commit_message(file_path: str, diff: str, debug_mode: bool = False) -> Tuple[str, str, str]:
-    """Generate commit message for a single file."""
-    try:
-        diff_text = f"File: {file_path}\n{diff}"
-        
-        # Handle new files differently
+def generate_commit_messages_batch(file_diffs: dict, debug_mode: bool = False) -> dict:
+    """Generate commit messages for all files in a single LLM call.
+
+    Args:
+        file_diffs: dict mapping file_path -> diff string
+        debug_mode: enable debug output
+
+    Returns:
+        dict mapping file_path -> commit message string
+    """
+    # Separate new files (no LLM needed) from modified files
+    results = {}
+    diffs_for_llm = {}
+
+    for file_path, diff in file_diffs.items():
         if "NEW_FILE:" in diff:
-            return file_path, "feat: add new file", None
-            
-        prompt = f"""
-Generate a concise commit message following Conventional Commits format. Return as JSON.
+            results[file_path] = "feat: add new file"
+        else:
+            diffs_for_llm[file_path] = diff
 
-Analyze the diff and create:
-1. HEADER: <type>: <short description> (max 50 chars, imperative mood)
-   Types: feat, fix, docs, style, refactor, test, chore
-2. BODY: Only if changes need explanation (max 2-3 lines)
-3. FOOTER: Only for breaking changes or issue refs
+    if not diffs_for_llm:
+        return results
 
-Keep it simple and focused. Most commits should only have a header.
+    # Build combined diff block
+    combined_diffs = "\n\n".join(
+        f"=== FILE: {fp} ===\n{diff}" for fp, diff in diffs_for_llm.items()
+    )
+    file_list_json = json.dumps(list(diffs_for_llm.keys()))
+
+    prompt = f"""Generate concise commit messages for each file following Conventional Commits format.
+
+Rules:
+- HEADER: <type>: <short description> (max 50 chars, imperative mood)
+- Types: feat, fix, docs, style, refactor, test, chore
+- Most commits should only have a header, add a body only if truly needed
+
+Return a JSON object mapping each file path to its commit message.
+The keys MUST be exactly these file paths: {file_list_json}
 
 Return JSON:
 {{
-  "header": "type: brief description",
-  "body": null,
-  "footer": null
+  "file_path_1": "type: description",
+  "file_path_2": "type: description"
 }}
 
-Diff:\n\n{diff_text}
+Diffs:
+
+{combined_diffs}
 """
-        
-        # Add timeout to curl request
+
+    try:
         response = subprocess.run([
             'curl',
             '-X', 'POST',
             'http://localhost:11434/api/generate',
             '-d', json.dumps({
-                "model": "deepseek-r1:32b",
+                "model": "qwen2.5-coder:7b",
                 "prompt": prompt,
                 "stream": False,
                 "response_format": {
@@ -144,72 +167,52 @@ Diff:\n\n{diff_text}
                 }
             })
         ], capture_output=True, text=True, check=True)
-        
-        # Parse the JSON response
-        try:
-            result = json.loads(response.stdout)
-            full_response = result['response'].strip()
-            
-            if debug_mode:
-                print(f"\nDEBUG: Full LLM Response for {file_path}:")
-                print("-" * 40)
-                print(full_response)
-                print("-" * 40)
-            
-            # Handle Deepseek's thinking tags - extract content after </think>
-            if "<think>" in full_response and "</think>" in full_response:
-                json_content = full_response.split("</think>")[-1].strip()
-            else:
-                json_content = full_response
-            
-            # Remove markdown code blocks that still appear despite json_object format
-            if json_content.startswith('```json'):
-                json_content = json_content[7:].strip()
-            elif json_content.startswith('```'):
-                json_content = json_content[3:].strip()
-            
-            if json_content.endswith('```'):
-                json_content = json_content[:-3].strip()
-            
-            if debug_mode:
-                print(f"DEBUG: Final JSON content to parse: '{json_content}'")
-            
-            # Check if json_content is empty
-            if not json_content:
-                return file_path, "chore: update file", "Empty JSON content after processing"
-            
-            # Parse the commit message JSON
-            commit_data = json.loads(json_content)
-            
-            # Extract components
-            header = commit_data.get('header', '').strip()
-            body = commit_data.get('body')
-            footer = commit_data.get('footer')
-            
-            # Validate header
-            if not header:
-                return file_path, "chore: update file", None
-            
-            # Build commit message following conventional commits format
-            commit_message = header
-            
-            # Add body if present and not null/empty
-            if body and body.strip():
-                commit_message += f"\n\n{body.strip()}"
-            
-            # Add footer if present and not null/empty  
-            if footer and footer.strip():
-                commit_message += f"\n\n{footer.strip()}"
-            
-            return file_path, commit_message, None
-            
-        except (json.JSONDecodeError, KeyError) as e:
-            return file_path, "chore: update file", f"JSON parsing error: {str(e)}"
-        
-    except subprocess.TimeoutExpired:
-        return file_path, "chore: automated commit", "LLM request timed out"
+
+        result = json.loads(response.stdout)
+        full_response = result['response'].strip()
+
+        if debug_mode:
+            print(f"\nDEBUG: Full batch LLM Response:")
+            print("-" * 40)
+            print(full_response)
+            print("-" * 40)
+
+        # Handle thinking tags
+        if "<think>" in full_response and "</think>" in full_response:
+            json_content = full_response.split("</think>")[-1].strip()
+        else:
+            json_content = full_response
+
+        # Remove markdown code blocks
+        if json_content.startswith('```json'):
+            json_content = json_content[7:].strip()
+        elif json_content.startswith('```'):
+            json_content = json_content[3:].strip()
+        if json_content.endswith('```'):
+            json_content = json_content[:-3].strip()
+
+        if debug_mode:
+            print(f"DEBUG: Final JSON content to parse: '{json_content}'")
+
+        if not json_content:
+            for fp in diffs_for_llm:
+                results[fp] = "chore: update file"
+            return results
+
+        commit_data = json.loads(json_content)
+
+        for fp in diffs_for_llm:
+            msg = commit_data.get(fp, '').strip() if isinstance(commit_data.get(fp), str) else ''
+            results[fp] = msg if msg else "chore: update file"
+
+        return results
+
     except Exception as e:
-        return file_path, "chore: automated commit", f"Error: {str(e)}"
+        if debug_mode:
+            print(f"Error in batch commit message generation: {e}")
+        for fp in diffs_for_llm:
+            results[fp] = "chore: update file"
+        return results
 
 def commit_and_push(file_path: str, message: str):
     """Commit a single file and push to the current branch."""
@@ -231,8 +234,8 @@ def commit_and_push(file_path: str, message: str):
         # Add specific file
         subprocess.run(['git', 'add', file_path], check=True)
         
-        # Commit with generated message
-        subprocess.run(['git', 'commit', '-m', message], check=True)
+        # Commit only this specific file (not everything staged)
+        subprocess.run(['git', 'commit', '-m', message, '--', file_path], check=True)
         
         # Get current branch
         branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD'])\
@@ -423,47 +426,57 @@ def generate_mr_summary(diff: str = None, commits: List[str] = None, debug_mode:
     try:
         if diff and len(diff) > 0:
             # Use diff-based approach for detailed analysis
-            prompt = f"""
-Generate a merge request summary based on the following git diff. Analyze the changes and provide:
+            prompt = f"""You are a technical writer creating a merge request summary. Analyze the provided git diff carefully and create a comprehensive summary.
 
-1. A concise title (50 chars max)
-2. A summary of what was changed and why
-3. Key technical details if relevant
-4. Focus on the business value and impact
+Your task:
+1. Review all the code changes in the diff
+2. Identify the main purpose and scope of the changes
+3. Understand what functionality was added, modified, or removed
+4. Create a concise title that captures the essence of the changes
+5. Write a detailed summary explaining what changed and why it matters
 
-Be accurate and factual. Don't make assumptions about features not evident in the diff.
+Focus on:
+- New features or functionality added
+- Bug fixes or improvements made
+- Code refactoring or optimization
+- Configuration or setup changes
+- Documentation updates
 
-Return as JSON:
+Git diff to analyze:
+{diff[:50000]}
+
+JSON structure expected:
 {{
-  "title": "Brief MR title",
-  "summary": "Detailed summary of changes and rationale"
-}}
-
-Git diff:
-{diff[:50000]}  
-"""
+  "title": "string (max 50 characters describing the main change)",
+  "summary": "string (detailed explanation of what changed, why it changed, and the impact)"
+}}"""
         elif commits and len(commits) > 0:
             # Use commit-based approach when diff is too long
             commits_text = "\n".join([f"- {commit}" for commit in commits])
-            prompt = f"""
-Generate a merge request summary based on the following commit messages. Analyze the commits and provide:
+            prompt = f"""You are a technical writer creating a merge request summary. Analyze the provided commit messages carefully and create a comprehensive summary.
 
-1. A concise title (50 chars max) 
-2. A summary of what was accomplished and why
+Your task:
+1. Review all the commit messages
+2. Identify common themes and the overall goal
 3. Group related changes together
-4. Focus on the overall goal and business value
+4. Create a concise title that captures the main achievement
+5. Write a detailed summary explaining what was accomplished and why
 
-Be accurate based on the commit messages. Don't invent features not mentioned.
+Focus on:
+- New features or functionality added
+- Bug fixes or improvements made
+- Code refactoring or optimization
+- Configuration or setup changes
+- Documentation updates
 
-Return as JSON:
-{{
-  "title": "Brief MR title",
-  "summary": "Detailed summary of changes and rationale"
-}}
-
-Commit messages:
+Commit messages to analyze:
 {commits_text}
-"""
+
+JSON structure expected:
+{{
+  "title": "string (max 50 characters describing the main accomplishment)",
+  "summary": "string (detailed explanation of what was accomplished, why it was done, and the overall impact)"
+}}"""
         else:
             return "No changes detected for merge request"
         
@@ -478,8 +491,10 @@ Commit messages:
                 "model": "deepseek-r1:32b",
                 "prompt": prompt,
                 "stream": False,
-                "response_format": {
-                    "type": "json_object"
+                "format": "json",
+                "options": {
+                    "temperature": 0.3,
+                    "top_p": 0.9
                 }
             })
         ], capture_output=True, text=True, check=True)
@@ -495,11 +510,12 @@ Commit messages:
                 print(full_response)
                 print("-" * 40)
             
-            # Handle Deepseek's thinking tags - extract content after </think>
-            if "<think>" in full_response and "</think>" in full_response:
-                json_content = full_response.split("</think>")[-1].strip()
-            else:
-                json_content = full_response
+            # Extract JSON from response - try multiple strategies
+            json_content = full_response
+            
+            # Remove thinking tags first
+            if "<think>" in json_content and "</think>" in json_content:
+                json_content = json_content.split("</think>")[-1].strip()
             
             # Remove markdown code blocks
             if json_content.startswith('```json'):
@@ -510,31 +526,192 @@ Commit messages:
             if json_content.endswith('```'):
                 json_content = json_content[:-3].strip()
             
-            # Try to find JSON object in the response
-            json_match = re.search(r'\{.*\}', json_content, re.DOTALL)
+            # Find JSON object in the text
+            json_match = re.search(r'\{[^{}]*"title"[^{}]*"summary"[^{}]*\}', json_content)
             if json_match:
                 json_content = json_match.group()
+            else:
+                # Fallback: try to find any JSON object
+                json_match = re.search(r'\{.*?\}', json_content, re.DOTALL)
+                if json_match:
+                    json_content = json_match.group()
             
             if debug_mode:
-                print(f"DEBUG: Cleaned JSON content: '{json_content}'")
+                print(f"DEBUG: Extracted JSON: '{json_content}'")
             
-            # Parse the MR JSON
-            mr_data = json.loads(json_content)
+            # Try to parse the JSON
+            if json_content and json_content.strip():
+                try:
+                    mr_data = json.loads(json_content)
+                    title = mr_data.get('title', '').strip()
+                    summary = mr_data.get('summary', '').strip()
+                    
+                    if title and summary:
+                        return f"# {title}\n\n{summary}"
+                except json.JSONDecodeError:
+                    pass
             
-            title = mr_data.get('title', 'Update branch').strip()
-            summary = mr_data.get('summary', 'Changes made to the codebase.').strip()
+            # If JSON parsing fails, try to extract title and summary manually
+            title_match = re.search(r'"title":\s*"([^"]+)"', full_response)
+            summary_match = re.search(r'"summary":\s*"([^"]+)"', full_response)
             
-            return f"# {title}\n\n{summary}"
+            if title_match and summary_match:
+                title = title_match.group(1).strip()
+                summary = summary_match.group(1).strip()
+                return f"# {title}\n\n{summary}"
+            
+            # Final fallback: create summary from commits or diff analysis
+            if commits and len(commits) > 0:
+                # Generate simple summary from commits
+                if len(commits) == 1:
+                    return f"# {commits[0][:50]}\n\nSingle commit with changes ready for review."
+                else:
+                    return f"# Multiple updates ({len(commits)} commits)\n\nThis PR includes {len(commits)} commits with various improvements and changes."
+            else:
+                return f"# Code updates\n\nChanges have been made and are ready for review."
             
         except (json.JSONDecodeError, KeyError) as e:
             if debug_mode:
                 print(f"JSON parsing error: {e}")
-            return "## Merge Request\n\nChanges have been made and are ready for review."
+            
+            # Fallback: try to create summary from available data
+            if commits and len(commits) > 0:
+                if len(commits) == 1:
+                    return f"# {commits[0][:50]}\n\nSingle commit ready for review."
+                else:
+                    return f"# Multiple updates ({len(commits)} commits)\n\nThis PR includes {len(commits)} commits with improvements."
+            else:
+                return f"# Code updates\n\nChanges ready for review."
         
     except Exception as e:
         if debug_mode:
             print(f"Error generating MR summary: {e}")
-        return "## Merge Request\n\nChanges have been made and are ready for review."
+        
+        # Emergency fallback using git data
+        if commits and len(commits) > 0:
+            return f"# {commits[0][:50]}\n\nChanges based on recent commits."
+        else:
+            return f"# Branch updates\n\nCode changes ready for merge."
+
+def refine_mr_summary(current_summary: str, guidance: str, debug_mode: bool = False) -> str:
+    """Refine MR summary based on user guidance."""
+    try:
+        prompt = f"""You are refining a merge request summary based on user feedback.
+
+Current MR summary:
+{current_summary}
+
+User's guidance for changes:
+{guidance}
+
+Apply the user's requested changes to improve the MR summary. Keep the same JSON format.
+
+JSON structure expected:
+{{
+  "title": "string (max 50 characters describing the main change)",
+  "summary": "string (detailed explanation of what changed, why it changed, and the impact)"
+}}"""
+
+        response = subprocess.run([
+            'curl',
+            '-X', 'POST',
+            'http://localhost:11434/api/generate',
+            '-d', json.dumps({
+                "model": "deepseek-r1:32b",
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": 0.3,
+                    "top_p": 0.9
+                }
+            })
+        ], capture_output=True, text=True, check=True)
+
+        result = json.loads(response.stdout)
+        full_response = result['response'].strip()
+
+        if debug_mode:
+            print("DEBUG: Refined MR Response:")
+            print("-" * 40)
+            print(full_response)
+            print("-" * 40)
+
+        json_content = full_response
+        if "<think>" in json_content and "</think>" in json_content:
+            json_content = json_content.split("</think>")[-1].strip()
+
+        if json_content.startswith('```json'):
+            json_content = json_content[7:].strip()
+        elif json_content.startswith('```'):
+            json_content = json_content[3:].strip()
+        if json_content.endswith('```'):
+            json_content = json_content[:-3].strip()
+
+        json_match = re.search(r'\{[^{}]*"title"[^{}]*"summary"[^{}]*\}', json_content)
+        if json_match:
+            json_content = json_match.group()
+        else:
+            json_match = re.search(r'\{.*?\}', json_content, re.DOTALL)
+            if json_match:
+                json_content = json_match.group()
+
+        if json_content and json_content.strip():
+            try:
+                mr_data = json.loads(json_content)
+                title = mr_data.get('title', '').strip()
+                summary = mr_data.get('summary', '').strip()
+                if title and summary:
+                    return f"# {title}\n\n{summary}"
+            except json.JSONDecodeError:
+                pass
+
+        return current_summary
+
+    except Exception as e:
+        if debug_mode:
+            print(f"Error refining MR summary: {e}")
+        return current_summary
+
+def validate_mr_summary(mr_summary: str, debug_mode: bool = False) -> Tuple[bool, str]:
+    """Interactive validation of MR summary. Returns (approved, final_summary)."""
+    while True:
+        print("\n" + "=" * 80)
+        print("Generated MR Summary:")
+        print("=" * 80)
+        print(mr_summary)
+        print("=" * 80)
+        print("\nOptions:")
+        print("  [y] Approve and create MR")
+        print("  [n] Cancel MR creation")
+        print("  [e] Edit with guidance (provide instructions to refine)")
+        print()
+
+        try:
+            choice = input("Your choice [y/n/e]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return False, mr_summary
+
+        if choice == 'y':
+            return True, mr_summary
+        elif choice == 'n':
+            print("MR creation cancelled.")
+            return False, mr_summary
+        elif choice == 'e':
+            try:
+                print("\nEnter guidance for refining the MR (e.g., 'make title shorter', 'add more detail about the API changes'):")
+                guidance = input("> ").strip()
+                if guidance:
+                    print("\nRefining MR summary...")
+                    mr_summary = refine_mr_summary(mr_summary, guidance, debug_mode)
+                else:
+                    print("No guidance provided, keeping current summary.")
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                return False, mr_summary
+        else:
+            print("Invalid choice. Please enter 'y', 'n', or 'e'.")
 
 def create_merge_request(debug_mode: bool = False):
     """Create a merge request with current branch against develop/main."""
@@ -558,14 +735,16 @@ def create_merge_request(debug_mode: bool = False):
         
         print(f"Diff size: ~{token_count} tokens")
         
+        # Get commits for fallback
+        commits = get_commit_messages_since_branch(base_branch, debug_mode)
+        
         # Use appropriate strategy based on diff size
         if token_count > 128000:
             print("Diff too large, using commit-based summary...")
-            commits = get_commit_messages_since_branch(base_branch, debug_mode)
             mr_summary = generate_mr_summary(commits=commits, debug_mode=debug_mode)
         else:
             print("Using diff-based summary...")
-            mr_summary = generate_mr_summary(diff=diff, debug_mode=debug_mode)
+            mr_summary = generate_mr_summary(diff=diff, commits=commits, debug_mode=debug_mode)
         
         if debug_mode:
             print("DEBUG: Generated MR Summary:")
@@ -573,13 +752,17 @@ def create_merge_request(debug_mode: bool = False):
             print(mr_summary)
             print("-" * 40)
         
+        approved, mr_summary = validate_mr_summary(mr_summary, debug_mode)
+        if not approved:
+            return False
+        
         # Check if glab, gh, or hub is available
         glab_available = subprocess.run(['which', 'glab'], capture_output=True).returncode == 0
         hub_available = subprocess.run(['which', 'hub'], capture_output=True).returncode == 0
         gh_available = subprocess.run(['which', 'gh'], capture_output=True).returncode == 0
         
         if glab_available:
-            # Use GitLab CLI
+            # Try glab directly — it will fail gracefully if the repo isn't on GitLab
             print("Using GitLab CLI (glab) to create merge request...")
             result = subprocess.run([
                 'glab', 'mr', 'create',
@@ -587,13 +770,14 @@ def create_merge_request(debug_mode: bool = False):
                 '--title', mr_summary.split('\n')[0].replace('# ', ''),
                 '--description', mr_summary
             ], capture_output=True, text=True)
-            
+
             if result.returncode == 0:
                 print("Merge request created successfully!")
                 print(result.stdout)
+                return True
             else:
-                print(f"Error creating merge request: {result.stderr}")
-                
+                print(f"Error creating merge request with glab: {result.stderr}")
+
         elif gh_available:
             # Use GitHub CLI
             print("Using GitHub CLI to create pull request...")
@@ -627,9 +811,9 @@ def create_merge_request(debug_mode: bool = False):
             else:
                 print(f"Error creating pull request: {result.stderr}")
         else:
-            # Fallback: output the summary for manual creation
             print("No supported CLI tool found (glab, gh, hub)")
-            print("Here's the generated merge request content:\n")
+            print("Install glab (GitLab) or gh (GitHub) for your platform.")
+            print("\nHere's the generated merge request content:\n")
             print("="*80)
             print(mr_summary)
             print("="*80)
@@ -664,89 +848,77 @@ def main():
         print("No changes to commit")
         return
     
-    # Keep track of all commits and errors
-    commit_summary = []
-    
-    # Process each file sequentially
+    # Collect diffs for all changed files
+    file_diffs = {}
+    file_operations = {}
     for file_path in changed_files:
-        try:
-            # Check if this is a file addition or deletion
-            is_add_or_del, operation_type = is_file_addition_or_deletion(file_path)
-            
-            # Get diff for single file
-            diff = get_file_diff(file_path)
-            
+        diff = get_file_diff(file_path)
+        if not diff:
             if debug_mode:
-                print(f"\nDEBUG: Processing file: {file_path}")
-                print(f"Operation type: {operation_type}")
-                print(f"Is addition/deletion: {is_add_or_del}")
-                print(f"Diff:\n{diff}")
-                print("-" * 80)
-            
-            # Generate commit message
-            file_path, message, error = generate_commit_message(file_path, diff, debug_mode)
-            
-            if error:
-                print(f"Error generating commit message for {file_path}: {error}")
-                commit_summary.append((file_path, "FAILED", error))
-                continue
-                
-            print(f"\nProcessing file: {file_path}")
-            print(f"Operation: {operation_type}")
-            print(f"Committing with message: {message}")
-            
-            try:
-                # Commit and push this file
-                commit_and_push(file_path, message)
-                commit_summary.append((file_path, message, None))
-                
-                # For additions or deletions, we've already pushed, so continue
-                if is_add_or_del:
-                    print(f"File {operation_type} pushed immediately")
-                    
-            except subprocess.CalledProcessError as e:
-                error_msg = str(e)
-                if "ignored by .gitignore" in error_msg:
-                    commit_summary.append((file_path, "SKIPPED", "File ignored by .gitignore"))
-                else:
-                    commit_summary.append((file_path, "FAILED", f"Git error: {error_msg}"))
-                continue
-
-            # Handle terraform formatting
-            if file_path.endswith('.tf'):
-                try:
-                    with open(file_path, 'r') as f:
-                        content_before = f.read()
-                    
-                    subprocess.run(['terraform', 'fmt', file_path], check=True)
-                    
-                    with open(file_path, 'r') as f:
-                        content_after = f.read()
-                    
-                    if content_before != content_after:
-                        print(f"Formatted terraform file: {file_path}")
-                        try:
-                            commit_and_push(file_path, "tf fmt")
-                            commit_summary.append((file_path, "tf fmt", None))
-                        except subprocess.CalledProcessError as e:
-                            error_msg = str(e)
-                            if "ignored by .gitignore" in error_msg:
-                                commit_summary.append((file_path, "SKIPPED", "File ignored by .gitignore"))
-                            else:
-                                commit_summary.append((file_path, "FAILED", f"Git error: {error_msg}"))
-                    else:
-                        print(f"No formatting changes needed for {file_path}")
-                        
-                except Exception as e:
-                    error_msg = f"Terraform formatting error: {str(e)}"
-                    print(f"Error: {error_msg}")
-                    commit_summary.append((file_path, "tf fmt", error_msg))
-                    
-        except Exception as e:
-            error_msg = f"Failed: {str(e)}"
-            print(f"Error processing file {file_path}: {e}")
-            commit_summary.append((file_path, "FAILED", error_msg))
+                print(f"Skipping {file_path}: no changes detected")
             continue
+        file_diffs[file_path] = diff
+        _, operation_type = is_file_addition_or_deletion(file_path)
+        file_operations[file_path] = operation_type
+        if debug_mode:
+            print(f"\nDEBUG: Collected diff for: {file_path} ({operation_type})")
+
+    if not file_diffs:
+        print("No changes to commit")
+        return
+
+    # Generate all commit messages in a single LLM call
+    print(f"Generating commit messages for {len(file_diffs)} file(s)...")
+    commit_messages = generate_commit_messages_batch(file_diffs, debug_mode)
+
+    # Commit and push each file
+    commit_summary = []
+    for file_path, message in commit_messages.items():
+        operation_type = file_operations.get(file_path, "modification")
+        print(f"\nProcessing file: {file_path}")
+        print(f"Operation: {operation_type}")
+        print(f"Committing with message: {message}")
+
+        try:
+            commit_and_push(file_path, message)
+            commit_summary.append((file_path, message, None))
+        except subprocess.CalledProcessError as e:
+            error_msg = str(e)
+            if "ignored by .gitignore" in error_msg:
+                commit_summary.append((file_path, "SKIPPED", "File ignored by .gitignore"))
+            else:
+                commit_summary.append((file_path, "FAILED", f"Git error: {error_msg}"))
+            continue
+
+        # Handle terraform formatting
+        if file_path.endswith('.tf'):
+            try:
+                with open(file_path, 'r') as f:
+                    content_before = f.read()
+
+                subprocess.run(['terraform', 'fmt', file_path], check=True)
+
+                with open(file_path, 'r') as f:
+                    content_after = f.read()
+
+                if content_before != content_after:
+                    print(f"Formatted terraform file: {file_path}")
+                    try:
+                        commit_and_push(file_path, "tf fmt")
+                        commit_summary.append((file_path, "tf fmt", None))
+                    except subprocess.CalledProcessError as e:
+                        error_msg = str(e)
+                        if "ignored by .gitignore" in error_msg:
+                            commit_summary.append((file_path, "SKIPPED", "File ignored by .gitignore"))
+                        else:
+                            commit_summary.append((file_path, "FAILED", f"Git error: {error_msg}"))
+                else:
+                    print(f"No formatting changes needed for {file_path}")
+
+            except Exception as e:
+                error_msg = f"Terraform formatting error: {str(e)}"
+                print(f"Error: {error_msg}")
+                commit_summary.append((file_path, "tf fmt", error_msg))
     
     # Print summary at the end
     print("\n" + "="*80)
